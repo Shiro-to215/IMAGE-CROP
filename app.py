@@ -21,6 +21,7 @@ class FrameApp:
         self.photo = None
         self.slider_update = False
         self.saved_count = 0
+        self.saved_items = []
         self.save_pressed = set()
         self.release_timers = {}
         self.output = tk.StringVar()
@@ -28,10 +29,11 @@ class FrameApp:
         self.info = tk.StringVar(value="フレーム — / —")
         self.status = tk.StringVar(value="準備完了")
         self.play_label = tk.StringVar(value="▶ 再生")
+        self.preview_title = tk.StringVar(value="保存した画像（0枚）")
 
         root.title("動画フレーム切り出し")
-        root.geometry("1100x780")
-        root.minsize(760, 560)
+        root.geometry("1100x880")
+        root.minsize(760, 660)
         style = ttk.Style(root)
         if "vista" in style.theme_names():
             style.theme_use("vista")
@@ -74,14 +76,32 @@ class FrameApp:
         play.pack(side="left")
         save = ttk.Button(controls, text="画像を保存  (Shift / Enter)", command=self.save_frame, state="disabled")
         save.pack(side="right")
+        self.undo_button = ttk.Button(controls, text="保存を取り消す  (Ctrl+Z)", command=self.undo_save, state="disabled")
+        self.undo_button.pack(side="right", padx=(0, 8))
         self.video_buttons.extend([play, save])
-        ttk.Label(main, text="← / →：1フレーム移動    Shift / Enter：PNG保存    Space：再生・一時停止    Ctrl+O：動画を開く").pack(anchor="w", pady=(12, 4))
+        ttk.Label(main, text="← / →：1フレーム移動    Shift / Enter：PNG保存    Ctrl+Z：保存取り消し    Space：再生・一時停止    Ctrl+O：動画を開く").pack(anchor="w", pady=(12, 4))
         ttk.Label(main, textvariable=self.status, wraplength=1020).pack(anchor="w")
+
+        preview_section = ttk.Frame(main)
+        preview_section.pack(fill="x", pady=(10, 0))
+        ttk.Label(preview_section, textvariable=self.preview_title).pack(anchor="w", pady=(0, 4))
+        self.preview_canvas = tk.Canvas(preview_section, height=110, background="#1e2430", highlightthickness=0)
+        self.preview_canvas.pack(fill="x")
+        self.preview_scrollbar = ttk.Scrollbar(preview_section, orient="horizontal", command=self.preview_canvas.xview)
+        self.preview_scrollbar.pack(fill="x")
+        self.preview_canvas.configure(xscrollcommand=self.preview_scrollbar.set)
+        self.preview_inner = tk.Frame(self.preview_canvas, background="#1e2430")
+        self.preview_window = self.preview_canvas.create_window((0, 0), window=self.preview_inner, anchor="nw")
+        self.preview_inner.bind("<Configure>", self._on_preview_configure)
+        self.preview_canvas.bind("<Configure>", self._on_preview_configure)
+        self.update_preview_strip()
 
         root.bind("<Left>", lambda event: self.key_step(-1))
         root.bind("<Right>", lambda event: self.key_step(1))
         root.bind("<space>", lambda event: self.key_play())
         root.bind("<Control-o>", lambda event: self.open_video())
+        root.bind("<Control-z>", self.key_undo)
+        root.bind("<Control-Z>", self.key_undo)
         for key in ("Shift_L", "Shift_R", "Return", "KP_Enter"):
             root.bind(f"<KeyPress-{key}>", self.key_save)
             root.bind(f"<KeyRelease-{key}>", self.release_save)
@@ -107,6 +127,8 @@ class FrameApp:
         if not self.output.get():
             self.output.set(str(video.path.parent / f"{video.path.stem}_frames"))
         self.saved_count = 0
+        self.saved_items.clear()
+        self.update_preview_strip()
         self.slider_update = True
         self.slider.configure(to=max(1, video.count - 1))
         self.slider.set(0)
@@ -251,6 +273,8 @@ class FrameApp:
         if not self.video:
             return
         self.pause()
+        if any(item["index"] == self.video.index for item in self.saved_items):
+            return
         if not self.output.get():
             self.choose_output()
             if not self.output.get():
@@ -260,8 +284,103 @@ class FrameApp:
         except Exception as error:
             messagebox.showerror("保存エラー", str(error))
             return
-        self.saved_count += 1
+        thumb = Image.fromarray(cv2.cvtColor(self.video.frame, cv2.COLOR_BGR2RGB))
+        thumb.thumbnail((116, 68), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(thumb)
+        new_item = {
+            "path": target,
+            "index": self.video.index,
+            "frame_number": self.video.index + 1,
+            "photo": photo,
+        }
+        self.saved_items.append(new_item)
+        self.saved_count = len(self.saved_items)
+        self.update_preview_strip(focus_item=new_item)
         self.status.set(f"保存しました（{self.saved_count}枚）：{target.name}")
+
+    def key_undo(self, event=None):
+        self.undo_save()
+        return "break"
+
+    def undo_save(self):
+        if not self.saved_items:
+            self.status.set("取り消せる保存画像はありません。")
+            return
+        self.pause()
+        item = self.saved_items[-1]
+        try:
+            item["path"].unlink(missing_ok=True)
+        except Exception as error:
+            messagebox.showerror("取り消しエラー", str(error))
+            return
+        self.saved_items.pop()
+        self.saved_count = len(self.saved_items)
+        self.update_preview_strip()
+        self.status.set(f"保存を取り消しました（残り{self.saved_count}枚）：{item['path'].name}")
+
+    def _on_preview_configure(self, event=None):
+        self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
+
+    def update_preview_strip(self, focus_item=None):
+        self.preview_title.set(f"保存した画像（{len(self.saved_items)}枚）")
+        if self.saved_items:
+            self.undo_button.state(["!disabled"])
+        else:
+            self.undo_button.state(["disabled"])
+
+        for child in self.preview_inner.winfo_children():
+            child.destroy()
+
+        focus_card = None
+        if not self.saved_items:
+            empty = tk.Label(
+                self.preview_inner,
+                text="保存した画像のプレビュー（画像・フレーム数）がここに表示されます",
+                bg="#1e2430",
+                fg="#94a3b8",
+                font=("Yu Gothic UI", 10),
+                padx=16,
+                pady=40,
+            )
+            empty.pack(side="left")
+        else:
+            ordered_items = sorted(self.saved_items, key=lambda item: item["index"])
+            for item in ordered_items:
+                card = tk.Frame(self.preview_inner, bg="#283142", padx=6, pady=6, cursor="hand2")
+                card.pack(side="left", padx=(6, 0), pady=6)
+                if item is focus_item:
+                    focus_card = card
+                img_label = tk.Label(card, image=item["photo"], bg="#151a23", width=116, height=68)
+                img_label.pack()
+                txt_label = tk.Label(
+                    card,
+                    text=f"フレーム {item['frame_number']:,}",
+                    bg="#283142",
+                    fg="#e2e8f0",
+                    font=("Yu Gothic UI", 9, "bold"),
+                )
+                txt_label.pack(pady=(4, 0))
+                idx = item["index"]
+                for widget in (card, img_label, txt_label):
+                    widget.bind("<Button-1>", lambda e, target_idx=idx: self._jump_from_preview(target_idx))
+
+        self.preview_inner.update_idletasks()
+        self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
+        if focus_card is not None:
+            total_width = max(1, self.preview_inner.winfo_reqwidth())
+            canvas_width = max(1, self.preview_canvas.winfo_width())
+            if total_width > canvas_width:
+                card_left = focus_card.winfo_x()
+                card_right = card_left + focus_card.winfo_reqwidth()
+                target_x = max(0, min(card_right - canvas_width + 12, total_width - canvas_width))
+                if card_left < target_x:
+                    target_x = max(0, card_left - 12)
+                self.preview_canvas.xview_moveto(target_x / total_width)
+
+    def _jump_from_preview(self, index):
+        self.pause()
+        self.move_to(index)
+        self.canvas.focus_set()
 
     def close(self):
         self.pause()
